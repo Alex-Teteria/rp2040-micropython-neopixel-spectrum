@@ -1,6 +1,6 @@
 # Author: Oleksandr Teteria
-# v1.0.4
-# 20.01.2026
+# v1.0.5
+# 21.01.2026
 # Implemented and tested on Pi Pico with RP2040
 # Released under the MIT license
 
@@ -31,7 +31,7 @@ IND_BANDS = (2, 1, 1, 1, 1, 1, 1, 5, 6, 11, 15, 24, 35, 53, 80, 160)
 
 NUM_BAND = 16 # кількість смуг
 FFT_SIZE = 1024
-# Опорна потужність повномасштабного синуса (Standard AES17 Reference)
+# Опорна потужність повномасштабного синуса, берем за 0 dB (Standard AES17 Reference)
 FS_RMS2 = 32767**2 / 2
 
 # ======================================
@@ -39,18 +39,11 @@ FS_RMS2 = 32767**2 / 2
 # ======================================
 M = 16
 
-spec_front = bytearray(M)
-spec_back  = bytearray(M)
-max_front = bytearray(M)
-max_back = bytearray(M)
-
 lock = _thread.allocate_lock()
-ready = False
 
-# Якщо True — Core0 не блокується, а перезаписує "останній кадр" (можливі пропуски).
-# Якщо False — Core0 чекає, поки Core1 забере кадр (без пропусків).
-DROP_FRAMES = True
-
+# 1-слотовий обмін спектром (memoryview від fastfft)
+spectr_front = None        # посилання на memoryview
+spectr_busy  = False       # True: Core1 ще НЕ завершив роботу зі spectr_front
 
 # ===============================================================
 # Динамічний масштаб та шумовий поріг(в "dB над шумовим порогом")
@@ -71,28 +64,58 @@ BAND_GAIN_DB = (
     2, 0, 0, 0,
     0, 0, 0, 0,
     0, 0, 2, 6,
-    4, 4, 6, 12
+    4, 4, 6, 10
     )
 
 _tmp_adj = array.array('f', [0.0] * NUM_BAND)  
 
 
-def core1_led_worker():
-    global ready
+def core1_dsp_led_worker():
+    global spectr_front, spectr_busy
 
-    # локальні буфери Core1 (не діляться з Core0)
+    # локальні буфери Core1
     spec_work = bytearray(M)
     max_work  = bytearray(M)
 
+    # peak-hold стан (лише Core1)
+    delay_max_level = 2
+    num_frame = 0
+    max_state = bytearray(M)
+
     while True:
+        # --- забрати спектр (memoryview) ---
         lock.acquire()
-        if ready:
-            spec_work[:] = spec_front
-            max_work[:]  = max_front
-            ready = False
+        if spectr_busy:
+            spectr = spectr_front  # локальне посилання на memoryview
             lock.release()
 
-            nm.apply_spectrum_buf(spec_work, max_work, button_peaks_en.value())  # viper2 + write()
+            # --- DSP: смуги + AGC ---
+            build_band_spectr(spectr, spec_work)
+            # або тест:
+            # build_band_spectr_test(spectr, spec_work)
+
+            # --- peak-hold (як було на Core0) ---
+            num_frame = (num_frame + 1) % delay_max_level
+            if num_frame == 0:
+                for j in range(M):
+                    if max_state[j] > 0:
+                        max_state[j] -= 1
+
+            for j in range(M):
+                v = spec_work[j]
+                if v > max_state[j]:
+                    max_state[j] = v
+
+            max_work[:] = max_state
+
+            # --- render + np.write() ---
+            nm.apply_spectrum_buf(spec_work, max_work, button_peaks_en.value())
+
+            # --- дозволяємо Core0 робити наступний rfft ---
+            lock.acquire()
+            spectr_busy = False
+            lock.release()
+
         else:
             lock.release()
             time.sleep_us(50)
@@ -200,67 +223,40 @@ def build_band_spectr(spec, out_buf):
 
 # ---------------- Core0 main loop ----------------
 def core0_main_loop():
-    global ready, spec_front, spec_back, max_front, max_back
-
-    delay_max_level = 2 # затримка спаду макимумів
-    num_frame = 0
-
-    # peak-hold стан (лише Core0)
-    max_state = bytearray(M)   # 0..16
+    global spectr_front, spectr_busy
 
     while True:
         t0 = time.ticks_us()
-
-        # 1) Новий спектр у spec_back
+        
+        # 1) Захват ADC
         adc_dma.start(ADC0, SAMPLE_FREQ, FFT_SIZE)
         while adc_dma.busy():
             time.sleep_us(5)
-        # Коли готово — отримуємо буфер потім FFT на даних буфера
+
+        # отримуємо буфер (тут важливо НЕ робити close() до завершення FFT)
         buf, peak = adc_dma.buffer_i16('auto', 10_000)
-        spectr = fastfft.rfft(buf, True) 
-        adc_dma.close()
-        # Будуєомо об'єднаний спектр (об'єднуючи біни за схемою IND_BANDS)
-        build_band_spectr(spectr, spec_back)
-        
-        # щоб поміряти шумовий поріг - верхнє коментуємо, а знизу знімаємо комент
-        # build_band_spectr_test(spectr, spec_back)
 
-        # 2) Спад 1 раз на delay_max_level кадрів (ПЕРЕД max())
-        num_frame = (num_frame + 1) % delay_max_level
-        if num_frame == 0:
-            for j in range(M):
-                if max_state[j] > 0:
-                    max_state[j] -= 1
-
-        # 3) Peak-hold: max_state = max(max_state, spec_back)
-        for j in range(M):
-            v = spec_back[j]
-            if v > max_state[j]:
-                max_state[j] = v
-
-        # 4) Знімок стану в max_back (це max_spectr кадру)
-        max_back[:] = max_state
-
-        # 5) Публікація кадру 
-        #    БЕЗ swap посилань, лише копія
-        if DROP_FRAMES:
+        # 2) Перед викликом rfft() чекаємо, поки Core1 завершив читання попереднього спектра
+        while True:
             lock.acquire()
-            spec_front[:] = spec_back
-            max_front[:]  = max_back
-            ready = True
+            busy = spectr_busy
             lock.release()
-        else:
-            while True:
-                lock.acquire()
-                if not ready:
-                    spec_front[:] = spec_back
-                    max_front[:]  = max_back
-                    ready = True
-                    lock.release()
-                    break
-                lock.release()
-                time.sleep_us(50)
+            if not busy: # Core1 вже завершив обробку
+                break
+            time.sleep_us(50)
 
+        # 3) FFT (повертає memoryview на внутрішній буфер fastfft)
+        spectr = fastfft.rfft(buf, True)
+
+        # 4) Тепер можна закрити adc_dma (бо FFT вже прочитав buf)
+        adc_dma.close()
+
+        # 5) Публікація спектра для Core1
+        lock.acquire()
+        spectr_front = spectr
+        spectr_busy = True
+        lock.release()
+        
         t1 = time.ticks_us()
         # print(time.ticks_diff(t1, t0))
 
@@ -275,6 +271,6 @@ if __name__ == '__main__':
     # тумблер переключення режимів відображення піків (1/0 - вкл/викл)
     button_peaks_en = machine.Pin(16, machine.Pin.IN, machine.Pin.PULL_UP)
 
-    _thread.start_new_thread(core1_led_worker, ())
+    _thread.start_new_thread(core1_dsp_led_worker, ())
     core0_main_loop()
 
